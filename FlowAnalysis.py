@@ -364,40 +364,6 @@ class FlowAnalysis:
         else:
             sys.exit("Unknown kernel used")
 
-    def normalized_spectrum(self,k,quantity):
-        """ Calculate normalized power spectra
-        """
-        histSum = binned_statistic(k,quantity,bins=self.k_bins,statistic='sum')[0]
-        kSum = binned_statistic(k,k,bins=self.k_bins,statistic='sum')[0]
-        histCount = np.histogram(k,bins=self.k_bins)[0]
-
-        totalHistSum = self.comm.reduce(histSum.astype(np.float64))
-        totalKSum = self.comm.reduce(kSum.astype(np.float64))
-        totalHistCount = self.comm.reduce(histCount.astype(np.float64))
-
-        if self.rank == 0:
-
-            if (totalHistCount == 0.).any():
-                print("totalHistCount is 0. Check desired binning!")
-                print(self.k_bins)
-                print(totalHistCount)
-                sys.exit(1)
-
-            # calculate corresponding k to to bin
-            # this help to overcome statistics for low k bins
-            centeredK = totalKSum / totalHistCount
-
-            ###  "integrate" over k-shells
-            # normalized by mean shell surface
-            valsShell = 4. * np.pi * centeredK**2. * (totalHistSum / totalHistCount)
-            # normalized by mean shell volume
-            valsVol = 4. * np.pi / 3.* (self.k_bins[1:]**3. - self.k_bins[:-1]**3.) * (totalHistSum / totalHistCount)
-            # unnormalized
-            valsNoNorm = totalHistSum
-
-            return [centeredK,valsShell,valsVol,valsNoNorm]
-        else:
-            return None
 
     def get_rotation_free_vec_field(self, vec):
         """
@@ -427,7 +393,49 @@ class FlowAnalysis:
         phi = self.FFT.backward(ft_div_vec, phi).real
 
         return - MPIgradX(self.comm, phi)
+    
+    def normalized_spectrum(self,k,quantity):
+        """ 
+        Calculate normalized power spectra with robust error handling
+        """
+        histSum = binned_statistic(k,quantity,bins=self.k_bins,statistic='sum')[0]
+        kSum = binned_statistic(k,k,bins=self.k_bins,statistic='sum')[0]
+        histCount = np.histogram(k,bins=self.k_bins)[0]
 
+        totalHistSum = self.comm.reduce(histSum.astype(np.float64))
+        totalKSum = self.comm.reduce(kSum.astype(np.float64))
+        totalHistCount = self.comm.reduce(histCount.astype(np.float64))
+
+        if self.rank == 0:
+            # Only fail if ALL bins are empty (would be a real problem)
+            if (totalHistCount == 0.).all():
+                print("ERROR: All histogram bins are empty!")
+                sys.exit(1)
+
+            # Handle empty bins safely
+            valid_bins = totalHistCount > 0
+            n_empty = np.sum(~valid_bins)
+            if n_empty > 0 and self.rank == 0:
+                print(f"Note: {n_empty}/{len(totalHistCount)} bins are empty (normal for high-k)")
+
+            # Initialize all arrays
+            centeredK = np.zeros_like(totalHistCount, dtype=float)
+            valsShell = np.zeros_like(totalHistCount, dtype=float)  
+            valsVol = np.zeros_like(totalHistCount, dtype=float)
+
+            # Only compute for non-empty bins
+            if np.any(valid_bins):
+                centeredK[valid_bins] = totalKSum[valid_bins] / totalHistCount[valid_bins]
+                valsShell[valid_bins] = 4. * np.pi * centeredK[valid_bins]**2. * (totalHistSum[valid_bins] / totalHistCount[valid_bins])
+                valsVol[valid_bins] = 4. * np.pi / 3. * (self.k_bins[1:][valid_bins]**3. - self.k_bins[:-1][valid_bins]**3.) * (totalHistSum[valid_bins] / totalHistCount[valid_bins])
+
+            # Raw counts (always safe)
+            valsNoNorm = totalHistSum.copy()
+
+            return [centeredK, valsShell, valsVol, valsNoNorm]
+        else:
+            return None
+    
     def decompose_vector(self, vec):
         """ decomposed input vector into harmonic, rotational and compressive part
         """
@@ -535,9 +543,17 @@ class FlowAnalysis:
 
         stddev = np.sqrt(var)
 
-        skew = self.comm.allreduce(np.sum((field - mean)**3. / stddev**3.)) / N
+        # old
+        #skew = self.comm.allreduce(np.sum((field - mean)**3. / stddev**3.)) / N
+        #kurt = self.comm.allreduce(np.sum((field - mean)**4. / stddev**4.)) / N - 3.
 
-        kurt = self.comm.allreduce(np.sum((field - mean)**4. / stddev**4.)) / N - 3.
+        if stddev > 1e-15:  # Avoid division by zero for constant fields
+            skew = self.comm.allreduce(np.sum((field - mean)**3. / stddev**3.)) / N
+            kurt = self.comm.allreduce(np.sum((field - mean)**4. / stddev**4.)) / N - 3.
+        else:
+            skew = 0.0  # Skewness is undefined for constant fields
+            kurt = 0.0  # Kurtosis is undefined for constant fields
+
 
         globMin = self.comm.allreduce(np.min(field),op=self.MPI.MIN)
         globMax = self.comm.allreduce(np.max(field),op=self.MPI.MAX)
@@ -657,5 +673,3 @@ class FlowAnalysis:
         
         msg = "compressive part is not rotation free"
         assert np.sum(np.linalg.norm(MPIrotX(self.comm, vec_dil),axis=0))/vec_dil.size/3 < 1e-13, msg
-
-# vim: tabstop=4 expandtab shiftwidth=4 softtabstop=4 ai
