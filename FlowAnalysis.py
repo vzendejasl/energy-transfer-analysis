@@ -456,6 +456,7 @@ class FlowAnalysis:
         FT_field = newDistArray(self.FFT)
         FT_field = self.FFT.forward(field, FT_field)
 
+        # Note: FFT normalization follows mpi4py-fft plan (no extra scaling here).
         FT_fieldAbs2 = np.abs(FT_field)**2.
         PS_Full = self.normalized_spectrum(self.localKmag.reshape(-1),FT_fieldAbs2.reshape(-1))
 
@@ -482,19 +483,30 @@ class FlowAnalysis:
             self.outfile.require_dataset(name + '/CoSpec/Real', (4,len(self.k_bins)-1), dtype='f')[:,:] = PS_Real
 
     def vector_power_spectrum(self, name, vec):
+        # Real-space kinetic energy density (for Parseval check)
+        real_ke = 0.5 * self.comm.allreduce(np.sum(vec**2.)) / float(self.res**3)
+
         FT_vec = newDistArray(self.FFT,rank=1)
         for i in range(3):
             FT_vec[i] = self.FFT.forward(vec[i], FT_vec[i])
 
+        # Note: FFT normalization follows mpi4py-fft plan (no extra scaling here).
         FT_vecAbs2 = np.linalg.norm(FT_vec,axis=0)**2.
         PS_Full = self.normalized_spectrum(self.localKmag.reshape(-1),FT_vecAbs2.reshape(-1))
         
         totPowFull = self.comm.allreduce(np.sum(FT_vecAbs2))
+        # Spectral kinetic energy density assuming unnormalized forward FFT:
+        # sum_x |u|^2 = (1/N^3) * sum_k |U|^2, so mean(0.5|u|^2) = 0.5 * sum_k|U|^2 / N^6
+        spec_ke = 0.5 * totPowFull
         
         if self.rank == 0:
             self.outfile.require_dataset(name + '/PowSpec/Bins', (1,len(self.k_bins)), dtype='f')[0] = self.k_bins
             self.outfile.require_dataset(name + '/PowSpec/Full', (4,len(self.k_bins)-1), dtype='f')[:,:] = PS_Full
             self.outfile.require_dataset(name + '/PowSpec/TotFull', (1,), dtype='f')[0] = totPowFull
+            self.outfile.require_dataset(name + '/PowSpec/TotKE_real', (1,), dtype='f')[0] = real_ke
+            self.outfile.require_dataset(name + '/PowSpec/TotKE_spec', (1,), dtype='f')[0] = spec_ke
+            # Light-weight Parseval check
+            print(f"[{name}] KE(real)={real_ke:.6e}, KE(spec)={spec_ke:.6e}, ratio={spec_ke/real_ke if real_ke!=0 else np.nan:.3f}")
 
         # project components
         localVecDotKunit = np.sum(FT_vec*self.localKunit,axis = 0)
