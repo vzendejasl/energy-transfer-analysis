@@ -132,21 +132,37 @@ class FlowAnalysis:
         B = self.B
         Acc = self.Acc
         P = self.P
+
+        # Debug: confirm that all ranks reached analysis with consistent shapes
+        print(f"[rank {self.rank}] Entering run_analysis: U shape={U.shape}, rho shape={rho.shape}, FFT local_shape={FFTHelperFuncs.local_shape}")
+        sys.stdout.flush()
         
         if self.rank == 0:
             self.outfile = h5py.File(self.outfile_path, "w")
 
+        if self.rank == 0:
+            print("[rank 0] Computing vector_power_spectrum for: u, rhoU, rhoThirdU")
+            sys.stdout.flush()
         self.vector_power_spectrum('u',U)
         self.vector_power_spectrum('rhoU',np.sqrt(rho)*U)
         self.vector_power_spectrum('rhoThirdU',rho**(1./3.)*U)
 
+        if self.rank == 0:
+            print("[rank 0] Starting Helmholtz decomposition (u_s / u_c)")
+            sys.stdout.flush()
         vec_harm, vec_sol, vec_dil = self.decompose_vector(U)
+        if self.rank == 0:
+            print("[rank 0] Computing vector_power_spectrum for: u_s, u_c, rhou_s, rhou_c")
+            sys.stdout.flush()
         self.vector_power_spectrum('u_s',vec_sol)
         self.vector_power_spectrum('u_c',vec_dil)
         self.vector_power_spectrum('rhou_s',np.sqrt(rho)*vec_sol)
         self.vector_power_spectrum('rhou_c',np.sqrt(rho)*vec_dil)
         del vec_harm, vec_sol, vec_dil
 
+        if self.rank == 0:
+            print("[rank 0] Finished Helmholtz spectra, moving to scalar stats/spectra")
+            sys.stdout.flush()
         self.get_and_write_statistics_to_file(rho,"rho")
         self.get_and_write_statistics_to_file(np.log(rho),"lnrho")
         self.scalar_power_spectrum('rho',rho)
@@ -364,36 +380,51 @@ class FlowAnalysis:
         else:
             sys.exit("Unknown kernel used")
 
-
     def get_rotation_free_vec_field(self, vec):
         """
-        returns the rotation free component of a 3D 3 component vector field
-        based on 2nd order finite central differences by solving
-        discrete La Place eqn div V = - div (grad phi)
+        Calculates the dilatational (compressive) component using spectral projection.
+        Corrects for the Transposed Data Layout (Y, X, Z).
+        
+        Math: u_dil = k * (k . u) / k^2
         """
+        # 1. Forward FFT
+        FT_vec = newDistArray(self.FFT, rank=1)
+        for i in range(3):
+            FT_vec[i] = self.FFT.forward(vec[i], FT_vec[i])
 
-        # set up left side in Fourier space
-        div_vec = MPIdivX(self.comm, vec)
+        # 2. Get local wavenumbers and Map to Physical Axes
+        # Data is (Y, X, Z) -> localK is (ky, kx, kz)
+        ky = self.localK[0]
+        kx = self.localK[1]
+        kz = self.localK[2]
+        
+        # 3. Calculate k^2
+        k2 = kx**2 + ky**2 + kz**2
 
-        ft_div_vec = newDistArray(self.FFT, rank=0)
-        ft_div_vec = self.FFT.forward(div_vec, ft_div_vec)
+        # 4. Safe Inverse of k^2 (Fixes the AssertionError)
+        # Instead of masking the Distributed Array, we mask the local 'inv_k2' array
+        inv_k2 = np.zeros_like(k2)
+        mask = k2 > 0
+        inv_k2[mask] = 1.0 / k2[mask]
 
-        # discrete fourier representation of -div grad based on consecutive
-        # 2nd order first derivatives
-        denom = -1/2. * self.res**2. * (np.cos(4.*np.pi*self.localK[0]/self.res) +
-                                        np.cos(4.*np.pi*self.localK[1]/self.res) +
-                                        np.cos(4.*np.pi*self.localK[2]/self.res) - 3.)
+        # 5. Project: (k . u) / k^2
+        # Correct Dot Product: kx*Ux + ky*Uy + kz*Uz
+        k_dot_u = kx * FT_vec[0] + ky * FT_vec[1] + kz * FT_vec[2]
+        
+        factor = k_dot_u * inv_k2
 
-        # these are 0 in the nominator anyway, so set this to 1 to avoid
-        # division by zero
-        denom[denom == 0.] = 1.
+        FT_dil = newDistArray(self.FFT, rank=1)
+        FT_dil[0] = factor * kx # Proj x
+        FT_dil[1] = factor * ky # Proj y
+        FT_dil[2] = factor * kz # Proj z
 
-        ft_div_vec /= denom
-        phi = newDistArray(self.FFT, False, rank=0)
-        phi = self.FFT.backward(ft_div_vec, phi).real
+        # 6. Inverse FFT
+        dil = newDistArray(self.FFT, False, rank=1)
+        for i in range(3):
+            dil[i] = self.FFT.backward(FT_dil[i], dil[i]).real
 
-        return - MPIgradX(self.comm, phi)
-    
+        return dil
+
     def normalized_spectrum(self,k,quantity):
         """ 
         Calculate normalized power spectra with robust error handling
@@ -445,11 +476,58 @@ class FlowAnalysis:
         # dividing by N/3 as the FFTs are per dimension, i.e., normal is N^3 but N is 3N^3
         harm = total / (N/3)
 
-        dil = self.get_rotation_free_vec_field(vec)
+        # Spectral Helmholtz projection for compressive part
+        dil = self.spectral_dil(vec)
         sol = vec - harm.reshape((3,1,1,1)) - dil
 
         return harm, sol, dil
 
+    def spectral_dil(self, vec):
+            """
+            Compute compressive (irrotational) component using spectral projection.
+            FIXED for Transposed Data (Axis0=Y, Axis1=X) and Distributed Arrays.
+            """
+            # 1. Map FFT axes to Physical Wavenumbers
+            # FFT returns (k0, k1, k2). Since we transposed data to (Y, X, Z):
+            # k0 = ky, k1 = kx, k2 = kz
+            ky_grid, kx_grid, kz_grid = FFTHelperFuncs.local_wavenumbermesh
+            
+            # 2. Compute k^2
+            k2 = kx_grid**2 + ky_grid**2 + kz_grid**2
+    
+            # 3. Create Safe Inverse (Fixes AssertionError)
+            # We cannot use boolean masking on Distributed Arrays directly.
+            # Instead, we create a local numpy array for the inverse factor.
+            inv_k2 = np.zeros_like(k2)
+            nonzero_mask = k2 > 0
+            inv_k2[nonzero_mask] = 1.0 / k2[nonzero_mask]
+    
+            # 4. Forward FFT of Velocity
+            FT_vec = newDistArray(self.FFT, rank=1)
+            for i in range(3):
+                FT_vec[i] = self.FFT.forward(vec[i], FT_vec[i])
+    
+            # 5. Compute Divergence (k dot u)
+            # Correct Physics: kx*Ux + ky*Uy + kz*Uz
+            # Note: FT_vec[0] is Ux, FT_vec[1] is Uy
+            k_dot_u = kx_grid * FT_vec[0] + ky_grid * FT_vec[1] + kz_grid * FT_vec[2]
+    
+            # 6. Compute Scalar Factor for Projection
+            factor = k_dot_u * inv_k2
+    
+            # 7. Compute Dilatational Component in Fourier Space
+            # vec_dil = factor * vector_k
+            FT_dil = newDistArray(self.FFT, rank=1)
+            FT_dil[0] = factor * kx_grid # Ux component uses kx
+            FT_dil[1] = factor * ky_grid # Uy component uses ky
+            FT_dil[2] = factor * kz_grid # Uz component uses kz
+    
+            # 8. Backward FFT
+            dil = newDistArray(self.FFT, False, rank=1)
+            for i in range(3):
+                dil[i] = self.FFT.backward(FT_dil[i], dil[i]).real
+    
+            return dil
 
     def scalar_power_spectrum(self,name,field):
 
@@ -483,50 +561,71 @@ class FlowAnalysis:
             self.outfile.require_dataset(name + '/CoSpec/Real', (4,len(self.k_bins)-1), dtype='f')[:,:] = PS_Real
 
     def vector_power_spectrum(self, name, vec):
+        print(f"[rank {self.rank}] vector_power_spectrum start: {name}, local vec shape={vec.shape}, expected FFT local_shape={FFTHelperFuncs.local_shape}")
+        sys.stdout.flush()
+        vec = np.ascontiguousarray(vec)
         # Real-space kinetic energy density (for Parseval check)
         real_ke = 0.5 * self.comm.allreduce(np.sum(vec**2.)) / float(self.res**3)
+        real_ke = float(np.real(real_ke))
 
         FT_vec = newDistArray(self.FFT,rank=1)
         for i in range(3):
             FT_vec[i] = self.FFT.forward(vec[i], FT_vec[i])
+        print(f"[rank {self.rank}] vector_power_spectrum after forward: {name}")
+        sys.stdout.flush()
 
         # Note: FFT normalization follows mpi4py-fft plan (no extra scaling here).
         FT_vecAbs2 = np.linalg.norm(FT_vec,axis=0)**2.
         PS_Full = self.normalized_spectrum(self.localKmag.reshape(-1),FT_vecAbs2.reshape(-1))
+        print(f"[rank {self.rank}] vector_power_spectrum after normalized_spectrum: {name}")
+        sys.stdout.flush()
         
         totPowFull = self.comm.allreduce(np.sum(FT_vecAbs2))
+        totPowFull = float(np.real(totPowFull))
         # Spectral kinetic energy density assuming unnormalized forward FFT:
         # sum_x |u|^2 = (1/N^3) * sum_k |U|^2, so mean(0.5|u|^2) = 0.5 * sum_k|U|^2 / N^6
-        spec_ke = 0.5 * totPowFull
+        spec_ke = float(np.real(0.5 * totPowFull))
+        if self.rank == 0:
+            print(f"[rank 0] vector_power_spectrum after totals: {name}, totPowFull={totPowFull:.6e}")
+            sys.stdout.flush()
         
         if self.rank == 0:
             self.outfile.require_dataset(name + '/PowSpec/Bins', (1,len(self.k_bins)), dtype='f')[0] = self.k_bins
             self.outfile.require_dataset(name + '/PowSpec/Full', (4,len(self.k_bins)-1), dtype='f')[:,:] = PS_Full
-            self.outfile.require_dataset(name + '/PowSpec/TotFull', (1,), dtype='f')[0] = totPowFull
-            self.outfile.require_dataset(name + '/PowSpec/TotKE_real', (1,), dtype='f')[0] = real_ke
-            self.outfile.require_dataset(name + '/PowSpec/TotKE_spec', (1,), dtype='f')[0] = spec_ke
+            self.outfile.require_dataset(name + '/PowSpec/TotFull', (1,), dtype='f8')[0] = float(totPowFull)
+            self.outfile.require_dataset(name + '/PowSpec/TotKE_real', (1,), dtype='f8')[0] = float(real_ke)
+            self.outfile.require_dataset(name + '/PowSpec/TotKE_spec', (1,), dtype='f8')[0] = float(spec_ke)
             # Light-weight Parseval check
             print(f"[{name}] KE(real)={real_ke:.6e}, KE(spec)={spec_ke:.6e}, ratio={spec_ke/real_ke if real_ke!=0 else np.nan:.3f}")
 
-        # project components
-        localVecDotKunit = np.sum(FT_vec*self.localKunit,axis = 0)
+        # Spectral Helmholtz projection for Dil/Sol spectra
+        # local_wavenumbermesh is already aligned with FFT/local data ordering
+        kx, ky, kz = FFTHelperFuncs.local_wavenumbermesh
+        k2 = kx**2 + ky**2 + kz**2
+        mask = k2 != 0.0
 
-        FT_Dil = localVecDotKunit * self.localKunit
+        FT_Dil = newDistArray(self.FFT, rank=1)
+        for i in range(3):
+            FT_Dil[i].fill(0.0)
+        kdotv = kx * FT_vec[0] + ky * FT_vec[1] + kz * FT_vec[2]
+        k2_safe = k2.copy()
+        k2_safe[~mask] = 1.0  # avoid divide by zero
+        proj = (kdotv / k2_safe) * mask  # set k=0 to zero
+        for i, kcomp in enumerate([kx, ky, kz]):
+            FT_Dil[i][...] = kcomp * proj
         FT_DilAbs2 = np.linalg.norm(FT_Dil,axis=0)**2.
         PS_Dil = self.normalized_spectrum(self.localKmag.reshape(-1),FT_DilAbs2.reshape(-1))
         
         FT_Sol = FT_vec - FT_Dil
+        # remove harmonic (k=0) from solenoidal component
         if self.rank == 0:
-            # remove harmonic part from solenoidal component
-            FT_Sol[:,0,0,0] = 0.
+            FT_Sol[:,0,0,0] = 0.0
         FT_SolAbs2 = np.linalg.norm(FT_Sol,axis=0)**2.
         PS_Sol = self.normalized_spectrum(self.localKmag.reshape(-1),FT_SolAbs2.reshape(-1))
 
-
-
-        totPowDil = self.comm.allreduce(np.sum(FT_DilAbs2))
-        totPowSol = self.comm.allreduce(np.sum(FT_SolAbs2))
-        totPowHarm = np.linalg.norm(FT_vec[:,0,0,0],axis=0)**2.
+        totPowDil = float(np.real(self.comm.allreduce(np.sum(FT_DilAbs2))))
+        totPowSol = float(np.real(self.comm.allreduce(np.sum(FT_SolAbs2))))
+        totPowHarm = float(np.real(np.linalg.norm(FT_vec[:,0,0,0],axis=0)**2.))
 
         if self.rank == 0:
             self.outfile.require_dataset(name + '/PowSpec/Bins', (1,len(self.k_bins)), dtype='f')[0] = self.k_bins
@@ -536,6 +635,11 @@ class FlowAnalysis:
             self.outfile.require_dataset(name + '/PowSpec/TotSol', (1,), dtype='f')[0] = totPowSol
             self.outfile.require_dataset(name + '/PowSpec/TotDil', (1,), dtype='f')[0] = totPowDil
             self.outfile.require_dataset(name + '/PowSpec/TotHarm', (1,), dtype='f')[0] = totPowHarm
+
+        print(f"[rank {self.rank}] vector_power_spectrum end: {name}")
+        sys.stdout.flush()
+        # Ensure temporaries are released before next spectrum to avoid memory pressure
+        del FT_vec, FT_vecAbs2, PS_Full, FT_Dil, FT_DilAbs2, PS_Dil, FT_Sol, FT_SolAbs2, PS_Sol
 
     def get_and_write_statistics_to_file(self,field,name,bounds=None):
         """

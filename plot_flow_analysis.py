@@ -54,39 +54,68 @@ def print_ke(infile: str):
             print(f"  KinEnDensity mean   = {km:.6e}")
 
 
-def load_ke_spectrum(infile: str):
-    """Return k centers and kinetic energy per bin (0.5*|U|^2) from stored spectra."""
+def load_vector_spectra(infile: str):
+    """
+    Return k centers and kinetic energy per bin (0.5*|U|^2) for total,
+    compressive (Dil) and solenoidal (Sol) parts if present.
+    """
     with h5py.File(infile, "r") as f:
         if "u/PowSpec/Bins" not in f or "u/PowSpec/Full" not in f:
-            return None, None
+            return None
         bins = np.array(f["u/PowSpec/Bins"])[0]
-        full = np.array(f["u/PowSpec/Full"])  # [centeredK, shell, vol, no_norm]
         centers = 0.5 * (bins[:-1] + bins[1:])
-        no_norm = full[3]
-        ke_bins = 0.5 * no_norm
-        return centers, ke_bins
+
+        def extract(path):
+            if path not in f:
+                return None
+            arr = np.array(f[path])  # [centeredK, shell, vol, no_norm]
+            return 0.5 * arr[3]  # KE per bin
+
+        total = extract("u/PowSpec/Full")
+        dil = extract("u/PowSpec/Dil")
+        sol = extract("u/PowSpec/Sol")
+        return {"k": centers, "total": total, "dil": dil, "sol": sol}
 
 
-def write_spectrum_txt(path: str, k, ek):
-    mask = ek > 0
-    k = k[mask]
-    ek = ek[mask]
+def write_spectrum_txt(path: str, spectra: dict):
+    k = spectra["k"]
+    total = spectra.get("total")
+    dil = spectra.get("dil")
+    sol = spectra.get("sol")
+    mask = (total > 0) if total is not None else np.ones_like(k, dtype=bool)
     with open(path, "w") as fh:
-        fh.write("# k  E(k)\n")
-        for kk, ee in zip(k, ek):
-            fh.write(f"{kk:.8e} {ee:.8e}\n")
+        header = "# k  E_total"
+        if dil is not None:
+            header += "  E_dil"
+        if sol is not None:
+            header += "  E_sol"
+        fh.write(header + "\n")
+        for idx, kk in enumerate(k):
+            if not mask[idx]:
+                continue
+            line = f"{kk:.8e}"
+            if total is not None:
+                line += f" {total[idx]:.8e}"
+            if dil is not None:
+                line += f" {dil[idx]:.8e}"
+            if sol is not None:
+                line += f" {sol[idx]:.8e}"
+            fh.write(line + "\n")
     print(f"Wrote {path}")
 
 
-def plot_ke_spectrum(k, ek, out_png: str, show: bool, save: bool):
-    mask = ek > 0
-    k = k[mask]
-    ek = ek[mask]
-    if k.size == 0:
-        print("[WARN] No spectrum data to plot.")
-        return
-    plt.figure(figsize=(6, 4))
-    plt.loglog(k, ek + 1e-300, label="KE per bin (0.5|U|^2)")
+def plot_ke_spectrum(spectra: dict, out_png: str, show: bool, save: bool):
+    k = spectra["k"]
+    plt.figure(figsize=(7, 5))
+    if spectra.get("total") is not None:
+        mask = spectra["total"] > 0
+        plt.loglog(k[mask], spectra["total"][mask] + 1e-300, label="Total")
+    if spectra.get("dil") is not None:
+        mask = spectra["dil"] > 0
+        plt.loglog(k[mask], spectra["dil"][mask] + 1e-300, "--", label="Compressive")
+    if spectra.get("sol") is not None:
+        mask = spectra["sol"] > 0
+        plt.loglog(k[mask], spectra["sol"][mask] + 1e-300, ":", label="Rotational")
     plt.xlabel(r"$k$")
     plt.ylabel(r"$E(k)$")
     plt.grid(True, which="both", alpha=0.3)
@@ -120,14 +149,14 @@ def main():
 
     for fn in files:
         print_ke(fn)
-        k, ek = load_ke_spectrum(fn)
-        if k is None or ek is None:
+        spectra = load_vector_spectra(fn)
+        if spectra is None:
             print("[WARN] Spectrum data not found in file.")
             continue
         if args.txt:
-            write_spectrum_txt(args.txt, k, ek)
+            write_spectrum_txt(args.txt, spectra)
         if args.save_plot or args.show_plot:
-            plot_ke_spectrum(k, ek, out_png="spectrum.png", show=args.show_plot, save=args.save_plot)
+            plot_ke_spectrum(spectra, out_png="spectrum.png", show=args.show_plot, save=args.save_plot)
 
 
 if __name__ == "__main__":

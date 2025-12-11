@@ -482,19 +482,20 @@ def read_data_file_chunked(filename, chunk_size=5_000_000):
 
     return velx_grid, vely_grid, velz_grid, x_unique, y_unique, z_unique
 
-
 def distribute_velocity_field(U_global):
     """
     Broadcast the global velocity field (shape (3, Nx, Ny, Nz)) from rank 0
-    and slice it according to FFT.local_slice().
+    and slice it according to FFT.local_slice(). Verbose debug output.
     """
+    if rank == 0:
+        print(f"[rank {rank}] distribute: global shape {U_global.shape}, dtype={U_global.dtype}")
+        sys.stdout.flush()
+
     # Broadcast shape/dtype
     shape = comm.bcast(U_global.shape if rank == 0 else None, root=0)
     dtype = comm.bcast(U_global.dtype if rank == 0 else None, root=0)
     if rank != 0:
         U_global = np.empty(shape, dtype=dtype)
-    if rank == 0:
-        print(f"[rank {rank}] Broadcasting velocity field shape {shape}, dtype={dtype}")
     comm.Barrier()
     comm.Bcast(U_global, root=0)
     comm.Barrier()
@@ -503,11 +504,14 @@ def distribute_velocity_field(U_global):
     slc = FFTHelperFuncs.FFT.local_slice()
     if rank == 0:
         print(f"[rank {rank}] FFT local_slice={slc}, FFT local_shape={FFTHelperFuncs.local_shape}")
+        sys.stdout.flush()
     U_local = U_global[(slice(None),) + slc]
 
     # Ensure shape matches expected local_shape; permute spatial axes if needed
     target_shape = FFTHelperFuncs.local_shape
     lengths = [s.stop - s.start for s in slc]
+    
+    # Check if permutation is required to match FFT slab layout
     if tuple(lengths) != tuple(target_shape):
         import itertools
         perm = None
@@ -517,114 +521,102 @@ def distribute_velocity_field(U_global):
                 break
         if perm is None:
             raise SystemExit(f"Cannot match local slices {lengths} to target shape {target_shape}")
+        
+        # perm is purely spatial (0,1,2). We need to account for vector dim at index 0.
+        # So spatial 0 becomes index 1, spatial 1 becomes index 2, etc.
         axes_order = (0,) + tuple(1 + i for i in perm)
         U_local = np.transpose(U_local, axes_order)
         print(f"[rank {rank}] Permuting local velocity axes with order {axes_order} to match target {target_shape}")
+        sys.stdout.flush()
     else:
         print(f"[rank {rank}] Using local slab lengths {lengths} matching target {target_shape}")
-    return U_local
+        sys.stdout.flush()
+
+    # CRITICAL FIX: Ensure the array is contiguous in memory. 
+    # Transpose only creates a view; MPI/FFT libraries often require contiguous C-ordered memory.
+    return np.ascontiguousarray(U_local)
 
 def read_finite_element_data(args):
     """
-    Read finite element data from custom format
+    Read finite element data from custom format (Robust MPI Version)
     """
     import re
     
     data_path = args['data_path']
     
-    print(f"Reading FiniteElement data from: {data_path}")
-    
-    # Parse header
-    with open(data_path, 'r') as f:
-        header_lines = [next(f) for _ in range(6)]
-    
-    # Extract cycle and time 
+    # --- STEP 1: Rank 0 Reads Metadata ---
     cycle = 0
     time = 0.0
-    for line in header_lines:
-        if 'Cycle' in line:
-            cycle_match = re.search(r'Cycle\s*[:=]\s*(\d+)', line)
-            if cycle_match:
-                cycle = int(cycle_match.group(1))
-        if 'Time' in line:
-            time_match = re.search(r'Time\s*[:=]\s*([0-9.eE+-]+)', line)
-            if time_match:
-                time = float(time_match.group(1))
+    dims = (0, 0, 0)
     
-    print(f"Cycle: {cycle}, Time: {time}")
-    
-    # Load data in chunks and reconstruct grids (rank 0 only)
     if rank == 0:
+        print(f"Reading FiniteElement data from: {data_path}")
+        # Parse header
+        with open(data_path, 'r') as f:
+            header_lines = [next(f) for _ in range(6)]
+        
+        for line in header_lines:
+            if 'Cycle' in line:
+                m = re.search(r'Cycle\s*[:=]\s*(\d+)', line)
+                if m: cycle = int(m.group(1))
+            if 'Time' in line:
+                m = re.search(r'Time\s*[:=]\s*([0-9.eE+-]+)', line)
+                if m: time = float(m.group(1))
+        
+        print(f"Cycle: {cycle}, Time: {time}")
+        
+        # Load heavy data
         velx_grid, vely_grid, velz_grid, x_unique, y_unique, z_unique = read_data_file_chunked(data_path)
         nx, ny, nz = velx_grid.shape
+        dims = (nx, ny, nz)
         print(f"Grid dimensions: {nx} x {ny} x {nz}")
         sys.stdout.flush()
     else:
+        # Other ranks stay empty
         velx_grid = vely_grid = velz_grid = None
-        nx = ny = nz = None
-        x_unique = y_unique = z_unique = None
     
-    # Check if resolution matches expected
-    dims = comm.bcast((nx, ny, nz), root=0)
+    # --- STEP 2: Broadcast Metadata to everyone ---
+    # Everyone waits here until Rank 0 is done reading
+    dims = comm.bcast(dims, root=0)
+    cycle = comm.bcast(cycle, root=0)
+    time = comm.bcast(time, root=0)
     nx, ny, nz = dims
+    
+    # Check resolution
     expected_res = args['res']
     if rank == 0 and max(nx, ny, nz) != expected_res:
         print(f"WARNING: Grid size {max(nx,ny,nz)} doesn't match --res {expected_res}")
-        print(f"Consider using --res {max(nx,ny,nz)}")
 
-    # Compute some basic diagnostics on rank 0
+    comm.Barrier() # Ensure everyone is ready for distribution
+
     if rank == 0:
-        tke_physical = 0.5 * np.mean(velx_grid**2 + vely_grid**2 + velz_grid**2)
-        max_vel = np.sqrt(np.max(velx_grid**2 + vely_grid**2 + velz_grid**2))
-        print(f"Total Kinetic Energy: {tke_physical:.6e}")
-        print(f"Maximum velocity magnitude: {max_vel:.6e}")
-    
-    # Create fields dictionary
-    fields = {}
-    
-    # Velocity field - NOTE: Order is [3, nx, ny, nz] for vector fields
+        print(f"[rank {rank}] Header read complete. Starting distribution...")
+        sys.stdout.flush()
+
+    # --- STEP 3: Distribute Data ---
+    # Rank 0 packs the data, everyone calls distribute
     if rank == 0:
         U_global = np.array([velx_grid, vely_grid, velz_grid], dtype=np.float64)
     else:
         U_global = None
-    U_local = distribute_velocity_field(U_global)
-    fields['U'] = U_local
 
-    # Density field (assume uniform for now), sliced to local FFT shape
+    U_local = distribute_velocity_field(U_global)
+    
+    # --- STEP 4: Create Fields ---
+    fields = {}
+    fields['U'] = U_local
     fields['rho'] = np.ones(FFTHelperFuncs.local_shape, dtype=np.float64)
 
-    # Pressure (derive from isothermal EOS: P = rho * c_s^2, assuming c_s = 1)
     if args['eos'] == 'isothermal':
-        fields['P'] = fields['rho'].copy()  # P = rho when c_s = 1
+        fields['P'] = fields['rho'].copy()
     elif args['eos'] == 'adiabatic':
         fields['P'] = None
-        if rank == 0:
-            print("Warning: No pressure data available for adiabatic EOS")
     
-    # No magnetic field data
     fields['B'] = None
-    
-    # No external forcing/acceleration
     fields['Acc'] = None
-    
+
     if rank == 0:
         print("Successfully created fields dictionary")
-    print(f"  U local shape (rank {rank}): {fields['U'].shape}")
-    print(f"  rho local shape (rank {rank}): {fields['rho'].shape}")
-
-    # Debug: Check for problematic values (rank 0 only)
-    if rank == 0:
-        print(f"Velocity grid stats:")
-        for i, name in enumerate(['vx', 'vy', 'vz']):
-            field = [velx_grid, vely_grid, velz_grid][i]
-            n_nan = np.sum(np.isnan(field))
-            n_inf = np.sum(np.isinf(field))
-            n_finite = np.sum(np.isfinite(field))
-            print(f"  {name}: NaN={n_nan}, Inf={n_inf}, Finite={n_finite}, Min={np.nanmin(field):.6e}, Max={np.nanmax(field):.6e}")
-
-        print(f"Density grid stats:")
-        n_nan = np.sum(np.isnan(fields['rho']))
-        n_inf = np.sum(np.isinf(fields['rho']))
-        print(f"  rho: NaN={n_nan}, Inf={n_inf}, Min={np.nanmin(fields['rho']):.6e}, Max={np.nanmax(fields['rho']):.6e}")
+        sys.stdout.flush()
         
     return fields
