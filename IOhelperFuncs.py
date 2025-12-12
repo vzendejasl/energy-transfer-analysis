@@ -139,7 +139,7 @@ def readAllFieldsWithYT(fields,loadPath,Res,
     gid_x_s = rank // n_proc[1] * pencil_shape[0] # global x start index
     gid_y_s = rank % n_proc[1] * pencil_shape[1] # global y start index
 
-    start_pos = left_edge
+    start_pos = left_edge.copy()
     start_pos[0] += gid_x_s / Res * (right_edge[0] - left_edge[0])
     start_pos[1] += gid_y_s / Res * (right_edge[1] - left_edge[1])
     if rank == 0:
@@ -147,7 +147,7 @@ def readAllFieldsWithYT(fields,loadPath,Res,
         print("Chunk dimensions = ", pencil_shape)
 
 
-    ad = ds.h.covering_grid(level=0, left_edge=start_pos,dims=FFTHelperFuncs.local_shape)
+    ad = ds.covering_grid(level=0, left_edge=start_pos,dims=FFTHelperFuncs.local_shape)
 
     if rhoField is not None:
         fields['rho'] = ad[rhoField].d

@@ -54,6 +54,18 @@ def print_ke(infile: str):
             print(f"  KinEnDensity mean   = {km:.6e}")
 
 
+def print_moments(infile: str, fields=("u", "KinEnDensity")):
+    with h5py.File(infile, "r") as f:
+        for name in fields:
+            grp = f.get(f"{name}/moments")
+            if grp is None:
+                continue
+            def g(key):
+                return float(np.array(grp[key]).squeeze()) if key in grp else None
+            mean = g("mean"); rms = g("rms"); std = g("stddev"); mn = g("min"); mx = g("max")
+            print(f"[{name} moments] mean={mean:.6e} rms={rms:.6e} std={std:.6e} min={mn:.6e} max={mx:.6e}")
+
+
 def load_vector_spectra(infile: str):
     """
     Return k centers and kinetic energy per bin (0.5*|U|^2) for total,
@@ -128,6 +140,98 @@ def plot_ke_spectrum(spectra: dict, out_png: str, show: bool, save: bool):
         plt.show()
     plt.close()
 
+def collect_histograms(infile: str):
+    """
+    Collect histograms written by FlowAnalysis (hist/* datasets).
+    Returns list of (name, bins, counts).
+    """
+    hists = []
+    with h5py.File(infile, "r") as f:
+        for name, grp in f.items():
+            if not isinstance(grp, h5py.Group):
+                continue
+            if "hist" not in grp:
+                continue
+            for hname, dset in grp["hist"].items():
+                arr = np.array(dset)
+                if arr.shape[0] != 2:
+                    continue
+                bins = arr[0]
+                counts = arr[1][:len(bins)-1]  # ignore last padding slot
+                hists.append((f"{name}/hist/{hname}", bins, counts))
+    return hists
+
+def plot_histograms(hists, show=False, save=False):
+    for name, bins, counts in hists:
+        if counts.sum() == 0:
+            continue
+        pdf = counts / counts.sum() / np.diff(bins)
+        plt.figure(figsize=(6,4))
+        plt.step(bins[:-1], counts, where="post", label="hist")
+        plt.step(bins[:-1], pdf, where="post", label="pdf (norm)")
+        plt.xlabel(name)
+        plt.ylabel("count / pdf")
+        plt.yscale("log")
+        plt.legend()
+        plt.tight_layout()
+        if save:
+            safe_name = name.replace("/", "_")
+            out = f"{safe_name}.png"
+            plt.savefig(out, dpi=150)
+            print(f"Wrote {out}")
+        if show:
+            plt.show()
+        plt.close()
+
+def plot_split_spectrum(spectra: dict, out_png: str, show: bool, save: bool):
+    """Plot compressive and rotational spectra separately (no total curve)."""
+    if spectra.get("dil") is None and spectra.get("sol") is None:
+        return
+    k = spectra["k"]
+    plt.figure(figsize=(7, 4))
+    if spectra.get("dil") is not None:
+        mask = spectra["dil"] > 0
+        plt.loglog(k[mask], spectra["dil"][mask] + 1e-300, "--", label="Compressive (Dil)")
+    if spectra.get("sol") is not None:
+        mask = spectra["sol"] > 0
+        plt.loglog(k[mask], spectra["sol"][mask] + 1e-300, ":", label="Rotational (Sol)")
+    plt.xlabel(r"$k$")
+    plt.ylabel(r"$E(k)$")
+    plt.grid(True, which="both", alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    if save:
+        plt.savefig(out_png, dpi=150)
+        print(f"Wrote {out_png}")
+    if show:
+        plt.show()
+    plt.close()
+
+def plot_compensated_spectrum(spectra: dict, out_png: str, show: bool, save: bool):
+    """Plot k^(5/3) * E(k) for total, compressive, rotational."""
+    k = spectra["k"]
+    comp = k ** (5.0/3.0)
+    plt.figure(figsize=(7, 4))
+    if spectra.get("total") is not None:
+        mask = spectra["total"] > 0
+        plt.loglog(k[mask], spectra["total"][mask]*comp[mask] + 1e-300, label="Total (compensated)")
+    if spectra.get("dil") is not None:
+        mask = spectra["dil"] > 0
+        plt.loglog(k[mask], spectra["dil"][mask]*comp[mask] + 1e-300, "--", label="Compressive (compensated)")
+    if spectra.get("sol") is not None:
+        mask = spectra["sol"] > 0
+        plt.loglog(k[mask], spectra["sol"][mask]*comp[mask] + 1e-300, ":", label="Rotational (compensated)")
+    plt.xlabel(r"$k$")
+    plt.ylabel(r"$k^{5/3} E(k)$")
+    plt.grid(True, which="both", alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    if save:
+        plt.savefig(out_png, dpi=150)
+        print(f"Wrote {out_png}")
+    if show:
+        plt.show()
+    plt.close()
 
 def main():
     ap = argparse.ArgumentParser(description="Print kinetic energy stats from flow_output HDF5.")
@@ -136,6 +240,8 @@ def main():
     ap.add_argument("--save-plot", action="store_true", help="Save spectrum plot to spectrum.png")
     ap.add_argument("--show-plot", action="store_true", help="Show spectrum plot interactively")
     ap.add_argument("--txt", type=str, default="spectrum.txt", help="Write k,E(k) to this text file")
+    ap.add_argument("--plot-hist", action="store_true", help="Plot histograms/PDFs for available fields")
+    ap.add_argument("--save-hist", action="store_true", help="Save histogram plots to PNGs")
     args = ap.parse_args()
 
     if args.file:
@@ -157,6 +263,15 @@ def main():
             write_spectrum_txt(args.txt, spectra)
         if args.save_plot or args.show_plot:
             plot_ke_spectrum(spectra, out_png="spectrum.png", show=args.show_plot, save=args.save_plot)
+            plot_split_spectrum(spectra, out_png="spectrum_components.png", show=args.show_plot, save=args.save_plot)
+            plot_compensated_spectrum(spectra, out_png="spectrum_compensated.png", show=args.show_plot, save=args.save_plot)
+        print_moments(fn)
+        if args.plot_hist or args.save_hist:
+            hists = collect_histograms(fn)
+            if not hists:
+                print("[WARN] No histograms found in file.")
+            else:
+                plot_histograms(hists, show=args.plot_hist, save=args.save_hist)
 
 
 if __name__ == "__main__":
