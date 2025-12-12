@@ -482,7 +482,7 @@ def read_data_file_chunked(filename, chunk_size=5_000_000):
 
     return velx_grid, vely_grid, velz_grid, x_unique, y_unique, z_unique
 
-def distribute_velocity_field(U_global):
+def distribute_velocity_field(U_global, args):
     """
     Broadcast the global velocity field (shape (3, Nx, Ny, Nz)) from rank 0
     and slice it according to FFT.local_slice(). Verbose debug output.
@@ -501,10 +501,15 @@ def distribute_velocity_field(U_global):
     comm.Barrier()
 
     # Slice according to FFT decomposition
-    slc = FFTHelperFuncs.FFT.local_slice()
+    if args['type'] == 'transfer':
+        slc = FFTHelperFuncs.FFT.local_slice(False)
+    else:
+        slc = FFTHelperFuncs.FFT.local_slice()
+
     if rank == 0:
         print(f"[rank {rank}] FFT local_slice={slc}, FFT local_shape={FFTHelperFuncs.local_shape}")
         sys.stdout.flush()
+
     U_local = U_global[(slice(None),) + slc]
 
     # Ensure shape matches expected local_shape; permute spatial axes if needed
@@ -600,7 +605,7 @@ def read_finite_element_data(args):
     else:
         U_global = None
 
-    U_local = distribute_velocity_field(U_global)
+    U_local = distribute_velocity_field(U_global,args)
     
     # --- STEP 4: Create Fields ---
     fields = {}

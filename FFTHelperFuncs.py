@@ -106,6 +106,10 @@ def get_local_wavenumbermesh(FFT, L):
     # In parallel, this is [Global_X, Global_Y, Global_Z].
     # FlowAnalysis expects [Global_Y, Global_X, Global_Z] (k0, k1, k2).
     if comm.Get_size() > 1:
+        # Swap back to match FlowAnalysis expectation:
+        # Index 0 -> Global Y (currently at index 1)
+        # Index 1 -> Global X (currently at index 0)
+        # Index 2 -> Global Z (currently at index 2)
         return [Ks_broad[1], Ks_broad[0], Ks_broad[2]]
     else:
         return Ks_broad
