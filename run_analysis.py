@@ -34,9 +34,9 @@ parser.add_argument('--type',
 parser.add_argument('--data_type',
                     required=True,
                     type=str,
-                    choices=['Enzo', 'AthenaPP', 'AthenaPPHDF', 'AthenaHDFC', 'Athena'],
+                    choices=['Enzo', 'AthenaPP', 'AthenaPPHDF', 'AthenaHDFC', 'Athena', 'FiniteElement'],  
                     help='set data cube type')
-
+                    
 parser.add_argument('--data_path',
                     required=True,
                     type=str,

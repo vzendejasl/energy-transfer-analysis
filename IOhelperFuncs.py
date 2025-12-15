@@ -27,8 +27,10 @@ def read_fields(args):
     accFields = None
 
     time_start = MPI.Wtime()
-
-    if args['data_type'] == 'Enzo':
+    
+    if args['data_type'] == 'FiniteElement':
+        return read_finite_element_data(args)
+    elif args['data_type'] == 'Enzo':
         rhoField = "Density"
         velFields = ["x-velocity","y-velocity","z-velocity"]
         if args['b']:
@@ -137,7 +139,7 @@ def readAllFieldsWithYT(fields,loadPath,Res,
     gid_x_s = rank // n_proc[1] * pencil_shape[0] # global x start index
     gid_y_s = rank % n_proc[1] * pencil_shape[1] # global y start index
 
-    start_pos = left_edge
+    start_pos = left_edge.copy()
     start_pos[0] += gid_x_s / Res * (right_edge[0] - left_edge[0])
     start_pos[1] += gid_y_s / Res * (right_edge[1] - left_edge[1])
     if rank == 0:
@@ -145,7 +147,7 @@ def readAllFieldsWithYT(fields,loadPath,Res,
         print("Chunk dimensions = ", pencil_shape)
 
 
-    ad = ds.h.covering_grid(level=0, left_edge=start_pos,dims=FFTHelperFuncs.local_shape)
+    ad = ds.covering_grid(level=0, left_edge=start_pos,dims=FFTHelperFuncs.local_shape)
 
     if rhoField is not None:
         fields['rho'] = ad[rhoField].d
@@ -325,7 +327,7 @@ def readAllFieldsWithHDF(fields,loadPath,Res,
         print("Data cannot be split evenly among processes. Abort (for now) - fix me!")
         sys.exit(1)
 
-    if order is not "C" and order is not "F":
+    if order not in ("C", "F"):
         print("For safety reasons you have to specify the order (row or column major) for your data.")
         sys.exit(1)
 
@@ -366,3 +368,154 @@ def readAllFieldsWithHDF(fields,loadPath,Res,
 #        if rank == 0:
 #            print("WARNING: remember assuming isothermal EOS with c_s = 1, i.e. P = rho")
 #        P = rho
+
+# Add this function to IOhelperFuncs.py
+
+def read_finite_element_data(args):
+    """
+    Read finite element data from custom format
+    """
+    import re
+    
+    data_path = args['data_path']
+    
+    print(f"Reading FiniteElement data from: {data_path}")
+    
+    # Parse header
+    with open(data_path, 'r') as f:
+        header_lines = [next(f) for _ in range(6)]
+    
+    # Extract cycle and time 
+    cycle = 0
+    time = 0.0
+    for line in header_lines:
+        if 'Cycle' in line:
+            cycle_match = re.search(r'Cycle\s*[:=]\s*(\d+)', line)
+            if cycle_match:
+                cycle = int(cycle_match.group(1))
+        if 'Time' in line:
+            time_match = re.search(r'Time\s*[:=]\s*([0-9.eE+-]+)', line)
+            if time_match:
+                time = float(time_match.group(1))
+    
+    print(f"Cycle: {cycle}, Time: {time}")
+    
+    # Load data (skip 5 lines - the format shows 6 header lines but skip_header=5)
+    data = np.genfromtxt(data_path, delimiter=None, skip_header=6)
+    
+    if data.shape[1] != 6:
+        raise ValueError(f"Expected 6 columns (x,y,z,vx,vy,vz), got {data.shape[1]}")
+    
+    # Extract coordinates and velocities
+    xpos, ypos, zpos = data[:, 0], data[:, 1], data[:, 2]
+    velx, vely, velz = data[:, 3], data[:, 4], data[:, 5]
+    
+    # Round coordinates to handle precision issues
+    xpos_rounded = np.round(xpos, decimals=10)
+    ypos_rounded = np.round(ypos, decimals=10) 
+    zpos_rounded = np.round(zpos, decimals=10)
+    
+    # Get unique coordinates and determine grid
+    x_unique = np.sort(np.unique(xpos_rounded))
+    y_unique = np.sort(np.unique(ypos_rounded))
+    z_unique = np.sort(np.unique(zpos_rounded))
+    
+    nx, ny, nz = len(x_unique), len(y_unique), len(z_unique)
+    print(f"Grid dimensions: {nx} x {ny} x {nz}")
+    
+    # Check if resolution matches expected
+    expected_res = args['res']
+    if max(nx, ny, nz) != expected_res:
+        print(f"WARNING: Grid size {max(nx,ny,nz)} doesn't match --res {expected_res}")
+        print(f"Consider using --res {max(nx,ny,nz)}")
+    
+    # Create velocity grids
+    velx_grid = np.full((nx, ny, nz), np.nan)
+    vely_grid = np.full((nx, ny, nz), np.nan)
+    velz_grid = np.full((nx, ny, nz), np.nan)
+    
+    # Create coordinate-to-index mappings
+    x_idx = {val: i for i, val in enumerate(x_unique)}
+    y_idx = {val: i for i, val in enumerate(y_unique)} 
+    z_idx = {val: i for i, val in enumerate(z_unique)}
+    
+    # Fill grids
+    for i in range(len(xpos)):
+        try:
+            xi = x_idx[xpos_rounded[i]]
+            yi = y_idx[ypos_rounded[i]]
+            zi = z_idx[zpos_rounded[i]]
+            velx_grid[xi, yi, zi] = velx[i]
+            vely_grid[xi, yi, zi] = vely[i] 
+            velz_grid[xi, yi, zi] = velz[i]
+        except KeyError as e:
+            print(f"Warning: Could not map point {i} with coords {xpos_rounded[i], ypos_rounded[i], zpos_rounded[i]}")
+    
+    # Check for missing data
+    n_nan = np.sum(np.isnan(velx_grid))
+    if n_nan > 0:
+        print(f"Warning: {n_nan}/{nx*ny*nz} grid points have no data")
+    
+    # Handle NaNs and infinities
+    velx_grid = np.nan_to_num(velx_grid, nan=0.0, posinf=0.0, neginf=0.0)
+    vely_grid = np.nan_to_num(vely_grid, nan=0.0, posinf=0.0, neginf=0.0)
+    velz_grid = np.nan_to_num(velz_grid, nan=0.0, posinf=0.0, neginf=0.0)
+
+    velx_grid = velx_grid[:-1, :-1, :-1]
+    vely_grid = vely_grid[:-1, :-1, :-1]
+    velz_grid = velz_grid[:-1, :-1, :-1]
+    x_unique = x_unique[:-1]
+    y_unique = y_unique[:-1]
+    z_unique = z_unique[:-1]
+    
+    # Compute some basic diagnostics
+    tke_physical = 0.5 * np.mean(velx_grid**2 + vely_grid**2 + velz_grid**2)
+    max_vel = np.sqrt(np.max(velx_grid**2 + vely_grid**2 + velz_grid**2))
+    print(f"Total Kinetic Energy: {tke_physical:.6e}")
+    print(f"Maximum velocity magnitude: {max_vel:.6e}")
+    
+    # Create fields dictionary
+    fields = {}
+    
+    # Velocity field - NOTE: Order is [3, nx, ny, nz] for vector fields
+    fields['U'] = np.array([velx_grid, vely_grid, velz_grid])
+    
+    # Density field (assume uniform for now)
+    fields['rho'] = np.ones((nx-1, ny-1, nz-1), dtype=np.float64)
+    
+    # Pressure (derive from isothermal EOS: P = rho * c_s^2, assuming c_s = 1)
+    if args['eos'] == 'isothermal':
+        fields['P'] = fields['rho'].copy()  # P = rho when c_s = 1
+    elif args['eos'] == 'adiabatic':
+        # For adiabatic without temperature data, set P = None
+        # Could derive from energy if available
+        fields['P'] = None
+        print("Warning: No pressure data available for adiabatic EOS")
+    
+    # No magnetic field data
+    fields['B'] = None
+    
+    # No external forcing/acceleration
+    fields['Acc'] = None
+    
+    print("Successfully created fields dictionary")
+    print(f"  U shape: {fields['U'].shape}")
+    print(f"  rho shape: {fields['rho'].shape}")
+
+    # Add this after creating the velocity grids in read_finite_element_data():
+
+    # Debug: Check for problematic values
+    print(f"Velocity grid stats:")
+    for i, name in enumerate(['vx', 'vy', 'vz']):
+        field = [velx_grid, vely_grid, velz_grid][i]
+        n_nan = np.sum(np.isnan(field))
+        n_inf = np.sum(np.isinf(field))
+        n_finite = np.sum(np.isfinite(field))
+        print(f"  {name}: NaN={n_nan}, Inf={n_inf}, Finite={n_finite}, Min={np.nanmin(field):.6e}, Max={np.nanmax(field):.6e}")
+
+    print(f"Density grid stats:")
+    n_nan = np.sum(np.isnan(fields['rho']))
+    n_inf = np.sum(np.isinf(fields['rho']))
+    print(f"  rho: NaN={n_nan}, Inf={n_inf}, Min={np.nanmin(fields['rho']):.6e}, Max={np.nanmax(fields['rho']):.6e}")
+        
+    return fields

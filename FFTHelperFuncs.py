@@ -72,7 +72,7 @@ def get_local_wavenumbermesh(FFT, L):
         k = [np.fft.fftfreq(n, 1./n).astype(int) for n in N[:-1]]
         k.append(np.fft.rfftfreq(N[-1], 1./N[-1]).astype(int))
     K = [ki[si] for ki, si in zip(k, s)]
-    Ks = np.meshgrid(*K, indexing='ij', sparse=True)
+    Ks = list(np.meshgrid(*K, indexing='ij', sparse=True))
     Lp = 2*np.pi/L
     for i in range(3):
         Ks[i] = (Ks[i]*Lp[i]).astype(float)
