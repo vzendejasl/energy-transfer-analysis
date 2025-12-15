@@ -371,151 +371,262 @@ def readAllFieldsWithHDF(fields,loadPath,Res,
 
 # Add this function to IOhelperFuncs.py
 
+def read_data_file_chunked(filename, chunk_size=5_000_000):
+    """
+    Read velocity data file in chunks (pandas) to keep memory use modest.
+    Returns (velx_grid, vely_grid, velz_grid, x_unique, y_unique, z_unique).
+    """
+    try:
+        import pandas as pd
+    except ImportError as exc:
+        raise SystemExit("pandas is required for FiniteElement chunked reading; install it and retry.") from exc
+
+    print(f"Reading data from: {filename} (chunked, size={chunk_size})")
+    sys.stdout.flush()
+    reader = pd.read_csv(
+        filename,
+        sep=r"\s+",
+        skiprows=6,  # header has 6 lines
+        header=None,
+        names=["x", "y", "z", "vx", "vy", "vz"],
+        chunksize=chunk_size,
+        engine="python",
+        on_bad_lines="skip",
+    )
+
+    xpos_list, ypos_list, zpos_list = [], [], []
+    velx_list, vely_list, velz_list = [], [], []
+
+    for chunk in reader:
+        # Force numeric conversion; coerce non-numeric to NaN then drop if any
+        xp_raw = pd.to_numeric(chunk["x"], errors="coerce").to_numpy()
+        yp_raw = pd.to_numeric(chunk["y"], errors="coerce").to_numpy()
+        zp_raw = pd.to_numeric(chunk["z"], errors="coerce").to_numpy()
+        vx_raw = pd.to_numeric(chunk["vx"], errors="coerce").to_numpy()
+        vy_raw = pd.to_numeric(chunk["vy"], errors="coerce").to_numpy()
+        vz_raw = pd.to_numeric(chunk["vz"], errors="coerce").to_numpy()
+
+        # Drop rows with NaNs (e.g., malformed lines)
+        mask = ~(np.isnan(xp_raw) | np.isnan(yp_raw) | np.isnan(zp_raw) |
+                 np.isnan(vx_raw) | np.isnan(vy_raw) | np.isnan(vz_raw))
+        if not np.any(mask):
+            continue
+        xp_raw, yp_raw, zp_raw = xp_raw[mask], yp_raw[mask], zp_raw[mask]
+        vx_raw, vy_raw, vz_raw = vx_raw[mask], vy_raw[mask], vz_raw[mask]
+
+        xp = np.round(xp_raw, 10)
+        yp = np.round(yp_raw, 10)
+        zp = np.round(zp_raw, 10)
+        vx = vx_raw
+        vy = vy_raw
+        vz = vz_raw
+
+        xpos_list.append(xp)
+        ypos_list.append(yp)
+        zpos_list.append(zp)
+        velx_list.append(vx)
+        vely_list.append(vy)
+        velz_list.append(vz)
+
+    if not xpos_list:
+        raise SystemExit(f"No data found in {filename}")
+
+    total_pts = sum(arr.size for arr in xpos_list)
+    print(f"  Total data points: {total_pts}")
+
+    xpos = np.empty(total_pts, dtype=xpos_list[0].dtype)
+    ypos = np.empty(total_pts, dtype=ypos_list[0].dtype)
+    zpos = np.empty(total_pts, dtype=zpos_list[0].dtype)
+    velx = np.empty(total_pts, dtype=velx_list[0].dtype)
+    vely = np.empty(total_pts, dtype=vely_list[0].dtype)
+    velz = np.empty(total_pts, dtype=velz_list[0].dtype)
+
+    offset = 0
+    for xp, yp, zp, vx, vy, vz in zip(
+            xpos_list, ypos_list, zpos_list, velx_list, vely_list, velz_list):
+        n = xp.size
+        xpos[offset:offset+n] = xp
+        ypos[offset:offset+n] = yp
+        zpos[offset:offset+n] = zp
+        velx[offset:offset+n] = vx
+        vely[offset:offset+n] = vy
+        velz[offset:offset+n] = vz
+        offset += n
+
+    # Free chunk lists
+    del xpos_list, ypos_list, zpos_list, velx_list, vely_list, velz_list
+
+    x_unique = np.unique(xpos)
+    y_unique = np.unique(ypos)
+    z_unique = np.unique(zpos)
+    nx, ny, nz = len(x_unique), len(y_unique), len(z_unique)
+    print(f"  Grid dimensions: {nx} x {ny} x {nz}")
+
+    expected_num_points = nx * ny * nz
+    if total_pts != expected_num_points:
+        print(f"  Warning: Actual points ({total_pts}) != expected ({expected_num_points})")
+
+    velx_grid = np.zeros((nx, ny, nz))
+    vely_grid = np.zeros((nx, ny, nz))
+    velz_grid = np.zeros((nx, ny, nz))
+
+    x_idx = {val: i for i, val in enumerate(x_unique)}
+    y_idx = {val: i for i, val in enumerate(y_unique)}
+    z_idx = {val: i for i, val in enumerate(z_unique)}
+
+    for i in range(total_pts):
+        xi = x_idx[xpos[i]]
+        yi = y_idx[ypos[i]]
+        zi = z_idx[zpos[i]]
+        velx_grid[xi, yi, zi] = velx[i]
+        vely_grid[xi, yi, zi] = vely[i]
+        velz_grid[xi, yi, zi] = velz[i]
+
+    return (velx_grid[:-1, :-1, :-1], 
+        vely_grid[:-1, :-1, :-1], 
+        velz_grid[:-1, :-1, :-1], 
+        x_unique[:-1], 
+        y_unique[:-1], 
+        z_unique[:-1]) 
+
+    # return velx_grid, vely_grid, velz_grid, x_unique, y_unique, z_unique
+
+def distribute_velocity_field(U_global, args):
+    """
+    Broadcast the global velocity field (shape (3, Nx, Ny, Nz)) from rank 0
+    and slice it according to FFT.local_slice(). Verbose debug output.
+    """
+    if rank == 0:
+        print(f"[rank {rank}] distribute: global shape {U_global.shape}, dtype={U_global.dtype}")
+        sys.stdout.flush()
+
+    # Broadcast shape/dtype
+    shape = comm.bcast(U_global.shape if rank == 0 else None, root=0)
+    dtype = comm.bcast(U_global.dtype if rank == 0 else None, root=0)
+    if rank != 0:
+        U_global = np.empty(shape, dtype=dtype)
+    comm.Barrier()
+    comm.Bcast(U_global, root=0)
+    comm.Barrier()
+
+    slc = FFTHelperFuncs.FFT.local_slice(False)
+
+    if rank == 0:
+        print(f"[rank {rank}] FFT local_slice={slc}, FFT local_shape={FFTHelperFuncs.local_shape}")
+        sys.stdout.flush()
+
+    U_local = U_global[(slice(None),) + slc]
+
+    # Ensure shape matches expected local_shape; permute spatial axes if needed
+    target_shape = FFTHelperFuncs.local_shape
+    lengths = [s.stop - s.start for s in slc]
+    
+    # Check if permutation is required to match FFT slab layout
+    if tuple(lengths) != tuple(target_shape):
+        import itertools
+        perm = None
+        for p in itertools.permutations([0, 1, 2]):
+            if [lengths[i] for i in p] == list(target_shape):
+                perm = p
+                break
+        if perm is None:
+            raise SystemExit(f"Cannot match local slices {lengths} to target shape {target_shape}")
+        
+        # perm is purely spatial (0,1,2). We need to account for vector dim at index 0.
+        # So spatial 0 becomes index 1, spatial 1 becomes index 2, etc.
+        axes_order = (0,) + tuple(1 + i for i in perm)
+        U_local = np.transpose(U_local, axes_order)
+        print(f"[rank {rank}] Permuting local velocity axes with order {axes_order} to match target {target_shape}")
+        sys.stdout.flush()
+    else:
+        print(f"[rank {rank}] Using local slab lengths {lengths} matching target {target_shape}")
+        sys.stdout.flush()
+
+    # CRITICAL FIX: Ensure the array is contiguous in memory. 
+    # Transpose only creates a view; MPI/FFT libraries often require contiguous C-ordered memory.
+    return np.ascontiguousarray(U_local)
+
 def read_finite_element_data(args):
     """
-    Read finite element data from custom format
+    Read finite element data from custom format (Robust MPI Version)
     """
     import re
     
     data_path = args['data_path']
     
-    print(f"Reading FiniteElement data from: {data_path}")
-    
-    # Parse header
-    with open(data_path, 'r') as f:
-        header_lines = [next(f) for _ in range(6)]
-    
-    # Extract cycle and time 
+    # --- STEP 1: Rank 0 Reads Metadata ---
     cycle = 0
     time = 0.0
-    for line in header_lines:
-        if 'Cycle' in line:
-            cycle_match = re.search(r'Cycle\s*[:=]\s*(\d+)', line)
-            if cycle_match:
-                cycle = int(cycle_match.group(1))
-        if 'Time' in line:
-            time_match = re.search(r'Time\s*[:=]\s*([0-9.eE+-]+)', line)
-            if time_match:
-                time = float(time_match.group(1))
+    dims = (0, 0, 0)
     
-    print(f"Cycle: {cycle}, Time: {time}")
+    if rank == 0:
+        print(f"Reading FiniteElement data from: {data_path}")
+        # Parse header
+        with open(data_path, 'r') as f:
+            header_lines = [next(f) for _ in range(6)]
+        
+        for line in header_lines:
+            if 'Cycle' in line:
+                m = re.search(r'Cycle\s*[:=]\s*(\d+)', line)
+                if m: cycle = int(m.group(1))
+            if 'Time' in line:
+                m = re.search(r'Time\s*[:=]\s*([0-9.eE+-]+)', line)
+                if m: time = float(m.group(1))
+        
+        print(f"Cycle: {cycle}, Time: {time}")
+        
+        # Load heavy data
+        velx_grid, vely_grid, velz_grid, x_unique, y_unique, z_unique = read_data_file_chunked(data_path)
+        nx, ny, nz = velx_grid.shape
+        dims = (nx, ny, nz)
+        print(f"Grid dimensions: {nx} x {ny} x {nz}")
+        sys.stdout.flush()
+    else:
+        # Other ranks stay empty
+        velx_grid = vely_grid = velz_grid = None
     
-    # Load data (skip 5 lines - the format shows 6 header lines but skip_header=5)
-    data = np.genfromtxt(data_path, delimiter=None, skip_header=6)
+    # --- STEP 2: Broadcast Metadata to everyone ---
+    # Everyone waits here until Rank 0 is done reading
+    dims = comm.bcast(dims, root=0)
+    cycle = comm.bcast(cycle, root=0)
+    time = comm.bcast(time, root=0)
+    nx, ny, nz = dims
     
-    if data.shape[1] != 6:
-        raise ValueError(f"Expected 6 columns (x,y,z,vx,vy,vz), got {data.shape[1]}")
-    
-    # Extract coordinates and velocities
-    xpos, ypos, zpos = data[:, 0], data[:, 1], data[:, 2]
-    velx, vely, velz = data[:, 3], data[:, 4], data[:, 5]
-    
-    # Round coordinates to handle precision issues
-    xpos_rounded = np.round(xpos, decimals=10)
-    ypos_rounded = np.round(ypos, decimals=10) 
-    zpos_rounded = np.round(zpos, decimals=10)
-    
-    # Get unique coordinates and determine grid
-    x_unique = np.sort(np.unique(xpos_rounded))
-    y_unique = np.sort(np.unique(ypos_rounded))
-    z_unique = np.sort(np.unique(zpos_rounded))
-    
-    nx, ny, nz = len(x_unique), len(y_unique), len(z_unique)
-    print(f"Grid dimensions: {nx} x {ny} x {nz}")
-    
-    # Check if resolution matches expected
+    # Check resolution
     expected_res = args['res']
-    if max(nx, ny, nz) != expected_res:
+    if rank == 0 and max(nx, ny, nz) != expected_res:
         print(f"WARNING: Grid size {max(nx,ny,nz)} doesn't match --res {expected_res}")
-        print(f"Consider using --res {max(nx,ny,nz)}")
-    
-    # Create velocity grids
-    velx_grid = np.full((nx, ny, nz), np.nan)
-    vely_grid = np.full((nx, ny, nz), np.nan)
-    velz_grid = np.full((nx, ny, nz), np.nan)
-    
-    # Create coordinate-to-index mappings
-    x_idx = {val: i for i, val in enumerate(x_unique)}
-    y_idx = {val: i for i, val in enumerate(y_unique)} 
-    z_idx = {val: i for i, val in enumerate(z_unique)}
-    
-    # Fill grids
-    for i in range(len(xpos)):
-        try:
-            xi = x_idx[xpos_rounded[i]]
-            yi = y_idx[ypos_rounded[i]]
-            zi = z_idx[zpos_rounded[i]]
-            velx_grid[xi, yi, zi] = velx[i]
-            vely_grid[xi, yi, zi] = vely[i] 
-            velz_grid[xi, yi, zi] = velz[i]
-        except KeyError as e:
-            print(f"Warning: Could not map point {i} with coords {xpos_rounded[i], ypos_rounded[i], zpos_rounded[i]}")
-    
-    # Check for missing data
-    n_nan = np.sum(np.isnan(velx_grid))
-    if n_nan > 0:
-        print(f"Warning: {n_nan}/{nx*ny*nz} grid points have no data")
-    
-    # Handle NaNs and infinities
-    velx_grid = np.nan_to_num(velx_grid, nan=0.0, posinf=0.0, neginf=0.0)
-    vely_grid = np.nan_to_num(vely_grid, nan=0.0, posinf=0.0, neginf=0.0)
-    velz_grid = np.nan_to_num(velz_grid, nan=0.0, posinf=0.0, neginf=0.0)
 
-    velx_grid = velx_grid[:-1, :-1, :-1]
-    vely_grid = vely_grid[:-1, :-1, :-1]
-    velz_grid = velz_grid[:-1, :-1, :-1]
-    x_unique = x_unique[:-1]
-    y_unique = y_unique[:-1]
-    z_unique = z_unique[:-1]
+    comm.Barrier() # Ensure everyone is ready for distribution
+
+    if rank == 0:
+        print(f"[rank {rank}] Header read complete. Starting distribution...")
+        sys.stdout.flush()
+
+    # --- STEP 3: Distribute Data ---
+    # Rank 0 packs the data, everyone calls distribute
+    if rank == 0:
+        U_global = np.array([velx_grid, vely_grid, velz_grid], dtype=np.float64)
+    else:
+        U_global = None
+
+    U_local = distribute_velocity_field(U_global,args)
     
-    # Compute some basic diagnostics
-    tke_physical = 0.5 * np.mean(velx_grid**2 + vely_grid**2 + velz_grid**2)
-    max_vel = np.sqrt(np.max(velx_grid**2 + vely_grid**2 + velz_grid**2))
-    print(f"Total Kinetic Energy: {tke_physical:.6e}")
-    print(f"Maximum velocity magnitude: {max_vel:.6e}")
-    
-    # Create fields dictionary
+    # --- STEP 4: Create Fields ---
     fields = {}
-    
-    # Velocity field - NOTE: Order is [3, nx, ny, nz] for vector fields
-    fields['U'] = np.array([velx_grid, vely_grid, velz_grid])
-    
-    # Density field (assume uniform for now)
-    fields['rho'] = np.ones((nx-1, ny-1, nz-1), dtype=np.float64)
-    
-    # Pressure (derive from isothermal EOS: P = rho * c_s^2, assuming c_s = 1)
+    fields['U'] = U_local
+    fields['rho'] = np.ones(FFTHelperFuncs.local_shape, dtype=np.float64)
+
     if args['eos'] == 'isothermal':
-        fields['P'] = fields['rho'].copy()  # P = rho when c_s = 1
+        fields['P'] = fields['rho'].copy()
     elif args['eos'] == 'adiabatic':
-        # For adiabatic without temperature data, set P = None
-        # Could derive from energy if available
         fields['P'] = None
-        print("Warning: No pressure data available for adiabatic EOS")
     
-    # No magnetic field data
     fields['B'] = None
-    
-    # No external forcing/acceleration
     fields['Acc'] = None
-    
-    print("Successfully created fields dictionary")
-    print(f"  U shape: {fields['U'].shape}")
-    print(f"  rho shape: {fields['rho'].shape}")
 
-    # Add this after creating the velocity grids in read_finite_element_data():
-
-    # Debug: Check for problematic values
-    print(f"Velocity grid stats:")
-    for i, name in enumerate(['vx', 'vy', 'vz']):
-        field = [velx_grid, vely_grid, velz_grid][i]
-        n_nan = np.sum(np.isnan(field))
-        n_inf = np.sum(np.isinf(field))
-        n_finite = np.sum(np.isfinite(field))
-        print(f"  {name}: NaN={n_nan}, Inf={n_inf}, Finite={n_finite}, Min={np.nanmin(field):.6e}, Max={np.nanmax(field):.6e}")
-
-    print(f"Density grid stats:")
-    n_nan = np.sum(np.isnan(fields['rho']))
-    n_inf = np.sum(np.isinf(fields['rho']))
-    print(f"  rho: NaN={n_nan}, Inf={n_inf}, Min={np.nanmin(fields['rho']):.6e}, Max={np.nanmax(fields['rho']):.6e}")
+    if rank == 0:
+        print("Successfully created fields dictionary")
+        sys.stdout.flush()
         
     return fields
