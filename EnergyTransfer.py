@@ -11,7 +11,7 @@ class EnergyTransfer:
     
     def __init__(self, MPI, RES, fields, gamma):
         
-        self.gamma = gamma
+        self.gamma = gamma if gamma is not None else 1.0
         self.MPI = MPI
         self.comm = MPI.COMM_WORLD
         self.RES = RES
