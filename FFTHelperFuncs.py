@@ -44,12 +44,7 @@ def setup_fft(res, dtype=np.complex128):
     N = np.array([res, res, res], dtype=int)
     # using L = 2pi as we work (e.g. when binning) with integer wavenumbers
     L = np.array([2*np.pi, 2*np.pi, 2*np.pi], dtype=float)
-    
-    # --- CRITICAL FIX: FORCE 1D SLAB DECOMPOSITION ---
-    # We pass grid=(size, 1, 1) to ensure only the first axis is split.
-    # This prevents the dimension mismatch in MPIderivHelperFuncs.py
-    size = comm.Get_size()
-    FFT = PFFT(comm, N, axes=(0,1,2), collapse=False, dtype=dtype, grid=(size, 1, 1))
+    FFT = PFFT(comm, N, axes=(0,1,2), collapse=False, dtype=dtype)
 
     local_wavenumbermesh = get_local_wavenumbermesh(FFT, L)
     local_shape = newDistArray(FFT,False).shape
@@ -68,9 +63,7 @@ def setup_fft(res, dtype=np.complex128):
 # with modification for complex numbers
 def get_local_wavenumbermesh(FFT, L):
     """Returns local wavenumber mesh."""
-    # CRITICAL FIX 1: Get the slice for the TRANSFORMED (Spectral) array.
-    s = FFT.local_slice(True) 
-    
+    s = FFT.local_slice()
     N = FFT.global_shape()
     # Set wavenumbers in grid
     if FFT.dtype() == np.complex128:
@@ -78,38 +71,9 @@ def get_local_wavenumbermesh(FFT, L):
     else:
         k = [np.fft.fftfreq(n, 1./n).astype(int) for n in N[:-1]]
         k.append(np.fft.rfftfreq(N[-1], 1./N[-1]).astype(int))
-    
-    # Scale by domain size early
+    K = [ki[si] for ki, si in zip(k, s)]
+    Ks = list(np.meshgrid(*K, indexing='ij', sparse=True))
     Lp = 2*np.pi/L
-    k = [(ki * Lp[i]).astype(float) for i, ki in enumerate(k)]
-
-    # CRITICAL FIX 2: Handle Spectral Transpose in Parallel
-    # When using Slab decomposition (grid=[size,1,1]) on axis 0, mpi4py-fft 
-    # transposes the output spectral array to shape (N1, N0, N2).
-    # We must permute our 'k' vectors to match this transposed layout (1, 0, 2)
-    # so that the correct wavenumber matches the correct axis.
-    if comm.Get_size() > 1:
-        # Permute k: Global 1 (X), Global 0 (Y), Global 2 (Z)
-        k_ordered = [k[1], k[0], k[2]]
-    else:
-        k_ordered = k
-
-    # Create meshgrids using the aligned k vectors
-    K = [ki[si] for ki, si in zip(k_ordered, s)]
-    Ks = np.meshgrid(*K, indexing='ij', sparse=True)
-    
-    # Broadcast to full local shape
-    Ks_broad = [np.broadcast_to(k_i, FFT.shape(True)) for k_i in Ks]
-    
-    # CRITICAL FIX 3: Return in Global Order
-    # Ks_broad is currently ordered by [Output_Ax0, Output_Ax1, Output_Ax2].
-    # In parallel, this is [Global_X, Global_Y, Global_Z].
-    # FlowAnalysis expects [Global_Y, Global_X, Global_Z] (k0, k1, k2).
-    if comm.Get_size() > 1:
-        # Swap back to match FlowAnalysis expectation:
-        # Index 0 -> Global Y (currently at index 1)
-        # Index 1 -> Global X (currently at index 0)
-        # Index 2 -> Global Z (currently at index 2)
-        return [Ks_broad[1], Ks_broad[0], Ks_broad[2]]
-    else:
-        return Ks_broad
+    for i in range(3):
+        Ks[i] = (Ks[i]*Lp[i]).astype(float)
+    return [np.broadcast_to(k, FFT.shape(True)) for k in Ks]

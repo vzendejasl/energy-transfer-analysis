@@ -158,11 +158,10 @@ if args['type'] == 'transfer':
 
 
     if args['binning'] == 'lin':
-        # resolution/2 is float in py3; linspace expects an integer sample count
-        n_half = int(resolution // 2)
+        half_res = resolution // 2
         bins = np.concatenate((
-            np.linspace(0.5, n_half - 0.5, n_half, endpoint=True),
-            [float(resolution) / 2. * np.sqrt(3)]
+            np.linspace(0.5, resolution/2 - 0.5, half_res, endpoint=True),
+            [float(resolution)/2.*np.sqrt(3)]
         ))
     
     elif args['binning'] == "log":

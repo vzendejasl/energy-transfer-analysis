@@ -327,7 +327,7 @@ def readAllFieldsWithHDF(fields,loadPath,Res,
         print("Data cannot be split evenly among processes. Abort (for now) - fix me!")
         sys.exit(1)
 
-    if order != "C" and order != "F":
+    if order not in ("C", "F"):
         print("For safety reasons you have to specify the order (row or column major) for your data.")
         sys.exit(1)
 
@@ -368,6 +368,8 @@ def readAllFieldsWithHDF(fields,loadPath,Res,
 #        if rank == 0:
 #            print("WARNING: remember assuming isothermal EOS with c_s = 1, i.e. P = rho")
 #        P = rho
+
+# Add this function to IOhelperFuncs.py
 
 def read_data_file_chunked(filename, chunk_size=5_000_000):
     """
@@ -480,7 +482,14 @@ def read_data_file_chunked(filename, chunk_size=5_000_000):
         vely_grid[xi, yi, zi] = vely[i]
         velz_grid[xi, yi, zi] = velz[i]
 
-    return velx_grid, vely_grid, velz_grid, x_unique, y_unique, z_unique
+    return (velx_grid[:-1, :-1, :-1], 
+        vely_grid[:-1, :-1, :-1], 
+        velz_grid[:-1, :-1, :-1], 
+        x_unique[:-1], 
+        y_unique[:-1], 
+        z_unique[:-1]) 
+
+    # return velx_grid, vely_grid, velz_grid, x_unique, y_unique, z_unique
 
 def distribute_velocity_field(U_global, args):
     """
@@ -500,11 +509,7 @@ def distribute_velocity_field(U_global, args):
     comm.Bcast(U_global, root=0)
     comm.Barrier()
 
-    # Slice according to FFT decomposition
-    if args['type'] == 'transfer':
-        slc = FFTHelperFuncs.FFT.local_slice(False)
-    else:
-        slc = FFTHelperFuncs.FFT.local_slice()
+    slc = FFTHelperFuncs.FFT.local_slice(False)
 
     if rank == 0:
         print(f"[rank {rank}] FFT local_slice={slc}, FFT local_shape={FFTHelperFuncs.local_shape}")
